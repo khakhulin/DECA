@@ -23,6 +23,8 @@ from scipy.ndimage import morphology
 from skimage.io import imsave
 import cv2
 
+from decalib.models.lbs import batch_rodrigues
+
 
 def upsample_mesh(vertices, normals, faces, displacement_map, dense_template):
     ''' upsampling coarse mesh (with displacment map)
