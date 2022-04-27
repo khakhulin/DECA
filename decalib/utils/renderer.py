@@ -19,94 +19,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from skimage.io import imread
 import imageio
+import os
+
 from . import util
+
+from pytorch3d.structures import Meshes
+from pytorch3d.io import load_obj
+from pytorch3d.renderer.mesh import rasterize_meshes
+from pytorch3d.renderer.blending import BlendParams, sigmoid_alpha_blend, softmax_rgb_blend
+
 
 def set_rasterizer(type = 'pytorch3d'):
     if type == 'pytorch3d':
         global Meshes, load_obj, rasterize_meshes
-        from pytorch3d.structures import Meshes
-        from pytorch3d.io import load_obj
-        from pytorch3d.renderer.mesh import rasterize_meshes
-    elif type == 'standard':
-        global standard_rasterize, load_obj
-        import os
-        from .util import load_obj
-        # Use JIT Compiling Extensions
-        # ref: https://pytorch.org/tutorials/advanced/cpp_extension.html
-        from torch.utils.cpp_extension import load, CUDA_HOME
-        curr_dir = os.path.dirname(__file__)
-        standard_rasterize_cuda = \
-            load(name='standard_rasterize_cuda', 
-                sources=[f'{curr_dir}/rasterizer/standard_rasterize_cuda.cpp', f'{curr_dir}/rasterizer/standard_rasterize_cuda_kernel.cu'], 
-                extra_cuda_cflags = ['-std=c++14', '-ccbin=$$(which gcc-7)']) # cuda10.2 is not compatible with gcc9. Specify gcc 7 
-        from standard_rasterize_cuda import standard_rasterize
-        # If JIT does not work, try manually installation first
-        # 1. see instruction here: pixielib/utils/rasterizer/INSTALL.md
-        # 2. add this: "from .rasterizer.standard_rasterize_cuda import standard_rasterize" here
-
-class StandardRasterizer(nn.Module):
-    """ Alg: https://www.scratchapixel.com/lessons/3d-basic-rendering/rasterization-practical-implementation
-    Notice:
-        x,y,z are in image space, normalized to [-1, 1]
-        can render non-squared image
-        not differentiable
-    """
-    def __init__(self, height, width=None):
-        """
-        use fixed raster_settings for rendering faces
-        """
-        super().__init__()
-        if width is None:
-            width = height
-        self.h = h = height; self.w = w = width
-
-    def forward(self, vertices, faces, attributes=None, h=None, w=None):
-        device = vertices.device
-        if h is None:
-            h = self.h
-        if w is None:
-            w = self.h; 
-        bz = vertices.shape[0]
-        depth_buffer = torch.zeros([bz, h, w]).float().to(device) + 1e6
-        triangle_buffer = torch.zeros([bz, h, w]).int().to(device) - 1
-        baryw_buffer = torch.zeros([bz, h, w, 3]).float().to(device)
-        vert_vis = torch.zeros([bz, vertices.shape[1]]).float().to(device)
-        vertices = vertices.clone().float()
-        # compatibale with pytorch3d ndc, see https://github.com/facebookresearch/pytorch3d/blob/e42b0c4f704fa0f5e262f370dccac537b5edf2b1/pytorch3d/csrc/rasterize_meshes/rasterize_meshes.cu#L232
-        vertices[...,:2] = -vertices[...,:2]
-        vertices[...,0] = vertices[..., 0]*w/2 + w/2
-        vertices[...,1] = vertices[..., 1]*h/2 + h/2
-        vertices[...,0] = w - 1 - vertices[..., 0]
-        vertices[...,1] = h - 1 - vertices[..., 1]
-        vertices[...,0] = -1 + (2*vertices[...,0] + 1)/w
-        vertices[...,1] = -1 + (2*vertices[...,1] + 1)/h
-        #
-        vertices = vertices.clone().float()
-        vertices[...,0] = vertices[..., 0]*w/2 + w/2 
-        vertices[...,1] = vertices[..., 1]*h/2 + h/2 
-        vertices[...,2] = vertices[..., 2]*w/2
-        f_vs = util.face_vertices(vertices, faces)
-
-        standard_rasterize(f_vs, depth_buffer, triangle_buffer, baryw_buffer, h, w)
-        pix_to_face = triangle_buffer[:,:,:,None].long()
-        bary_coords = baryw_buffer[:,:,:,None,:]
-        vismask = (pix_to_face > -1).float()
-        D = attributes.shape[-1]
-        attributes = attributes.clone(); attributes = attributes.view(attributes.shape[0]*attributes.shape[1], 3, attributes.shape[-1])
-        N, H, W, K, _ = bary_coords.shape
-        mask = pix_to_face == -1
-        pix_to_face = pix_to_face.clone()
-        pix_to_face[mask] = 0
-        idx = pix_to_face.view(N * H * W * K, 1, 1).expand(N * H * W * K, 3, D)
-        pixel_face_vals = attributes.gather(0, idx).view(N, H, W, K, 3, D)
-        pixel_vals = (bary_coords[..., None] * pixel_face_vals).sum(dim=-2)
-        pixel_vals[mask] = 0  # Replace masked values in output.
-        pixel_vals = pixel_vals[:,:,:,0].permute(0,3,1,2)
-        pixel_vals = torch.cat([pixel_vals, vismask[:,:,:,0][:,None,:,:]], dim=1)
-        return pixel_vals
 
 class Pytorch3dRasterizer(nn.Module):
-    ## TODO: add support for rendering non-squared images, since pytorc3d supports this now
     """  Borrowed from https://github.com/facebookresearch/pytorch3d
     Notice:
         x,y,z are in image space, normalized
@@ -118,43 +45,35 @@ class Pytorch3dRasterizer(nn.Module):
         use fixed raster_settings for rendering faces
         """
         super().__init__()
-        raster_settings = {
+        self.raster_settings_dict = {
             'image_size': image_size,
             'blur_radius': 0.0,
             'faces_per_pixel': 1,
             'bin_size': None,
-            'max_faces_per_bin':  None,
+            'max_faces_per_bin': None,
             'perspective_correct': False,
         }
-        raster_settings = util.dict2obj(raster_settings)
-        self.raster_settings = raster_settings
+        self.raster_settings = util.dict2obj(self.raster_settings_dict)
 
-    def forward(self, vertices, faces, attributes=None, h=None, w=None):
+    def forward(self, vertices, faces, attributes=None):
         fixed_vertices = vertices.clone()
-        fixed_vertices[...,:2] = -fixed_vertices[...,:2]
-        raster_settings = self.raster_settings
-        if h is None and w is None:
-            image_size = raster_settings.image_size
-        else:
-            image_size = [h, w]
-            if h>w:
-                fixed_vertices[..., 1] = fixed_vertices[..., 1]*h/w
-            else:
-                fixed_vertices[..., 0] = fixed_vertices[..., 0]*w/h
-            
+        fixed_vertices[..., :2] = -fixed_vertices[..., :2]
         meshes_screen = Meshes(verts=fixed_vertices.float(), faces=faces.long())
+        raster_settings = self.raster_settings
         pix_to_face, zbuf, bary_coords, dists = rasterize_meshes(
             meshes_screen,
-            image_size=image_size,
+            image_size=raster_settings.image_size,
             blur_radius=raster_settings.blur_radius,
             faces_per_pixel=raster_settings.faces_per_pixel,
             bin_size=raster_settings.bin_size,
             max_faces_per_bin=raster_settings.max_faces_per_bin,
             perspective_correct=raster_settings.perspective_correct,
         )
+
         vismask = (pix_to_face > -1).float()
         D = attributes.shape[-1]
-        attributes = attributes.clone(); attributes = attributes.view(attributes.shape[0]*attributes.shape[1], 3, attributes.shape[-1])
+        attributes = attributes.clone()
+        attributes = attributes.view(attributes.shape[0] * attributes.shape[1], 3, attributes.shape[-1])
         N, H, W, K, _ = bary_coords.shape
         mask = pix_to_face == -1
         pix_to_face = pix_to_face.clone()
@@ -163,132 +82,291 @@ class Pytorch3dRasterizer(nn.Module):
         pixel_face_vals = attributes.gather(0, idx).view(N, H, W, K, 3, D)
         pixel_vals = (bary_coords[..., None] * pixel_face_vals).sum(dim=-2)
         pixel_vals[mask] = 0  # Replace masked values in output.
-        pixel_vals = pixel_vals[:,:,:,0].permute(0,3,1,2)
-        pixel_vals = torch.cat([pixel_vals, vismask[:,:,:,0][:,None,:,:]], dim=1)
-        # print(image_size)
-        # import ipdb; ipdb.set_trace()
+        pixel_vals = pixel_vals[:, :, :, 0].permute(0, 3, 1, 2)
+        pixel_vals = torch.cat([pixel_vals, vismask[:, :, :, 0][:, None, :, :]], dim=1)
+
         return pixel_vals
+
+    def extra_repr(self):
+        return '{image_size}px, blur_radius={blur_radius}, faces_per_pixel={faces_per_pixel}'.format(
+            **self.raster_settings_dict)
+
+
+class FragmentsContainer(object):
+    def __init__(self, pix_to_face, zbuf, bary_coords, dists):
+        self.pix_to_face = pix_to_face
+        self.zbuf = zbuf
+        self.bary_coords = bary_coords
+        self.dists = dists
+
+
+class SilhouetteRasterizer(nn.Module):
+    def __init__(self, image_size=224, sigma=1e-4):
+        super().__init__()
+        self.raster_settings_dict = {
+            'image_size': image_size,
+            'blur_radius': sigma,
+            'faces_per_pixel': 10,
+        }
+        self.raster_settings = util.dict2obj(self.raster_settings_dict)
+
+    def forward(self, vertices, faces):
+        batch_size = vertices.shape[0]
+
+        fixed_vertices = vertices.clone()
+        fixed_vertices[..., :2] = -fixed_vertices[..., :2]
+
+        meshes_screen = Meshes(verts=fixed_vertices.float(), faces=faces.long())
+
+        pix_to_face, zbuf, bary_coords, dists = rasterize_meshes(
+            meshes_screen,
+            image_size=self.raster_settings.image_size,
+            blur_radius=self.raster_settings.blur_radius,
+            faces_per_pixel=self.raster_settings.faces_per_pixel,
+        )
+
+        colors = torch.ones_like(bary_coords)
+        fragments = FragmentsContainer(pix_to_face, zbuf, bary_coords, dists)
+
+        images = sigmoid_alpha_blend(colors, fragments, BlendParams())
+
+        with torch.no_grad():
+            # Find vertices that lie in visibile faces
+            dtype = vertices.dtype
+            device = vertices.device
+            offset = torch.arange(batch_size, device=device)[:, None, None]
+
+            visible_face_idx = pix_to_face[..., 0].view(-1)
+
+            faces_all = faces + vertices.shape[1] * offset
+            faces_all = faces_all.view(-1, 3)
+            faces_all = torch.cat([faces_all, -torch.ones(1, 3, device=device).long()],
+                                  dim=0)  # add dummy face at the end
+
+            visible_vertices_all = faces_all[visible_face_idx].view(-1)
+
+            vertices_visibility = torch.zeros(batch_size * vertices.shape[1] + 1, dtype=dtype, device=device)
+            vertices_visibility[visible_vertices_all] = 1.0
+            vertices_visibility = vertices_visibility[:-1].view(batch_size, -1)
+
+        return images[..., 3:].permute(0, 3, 1, 2), vertices_visibility
+
+    def extra_repr(self):
+        return '{image_size}px, blur_radius={blur_radius}, faces_per_pixel={faces_per_pixel}'.format(
+            **self.raster_settings_dict)
+
 
 class SRenderY(nn.Module):
     def __init__(self, image_size, obj_filename, uv_size=256, rasterizer_type='pytorch3d'):
         super(SRenderY, self).__init__()
         self.image_size = image_size
-        self.uv_size = uv_size
-        if rasterizer_type == 'pytorch3d':
-            self.rasterizer = Pytorch3dRasterizer(image_size)
-            self.uv_rasterizer = Pytorch3dRasterizer(uv_size)
-            verts, faces, aux = load_obj(obj_filename)
-            uvcoords = aux.verts_uvs[None, ...]      # (N, V, 2)
-            uvfaces = faces.textures_idx[None, ...] # (N, F, 3)
-            faces = faces.verts_idx[None,...]
-        elif rasterizer_type == 'standard':
-            self.rasterizer = StandardRasterizer(image_size)
-            self.uv_rasterizer = StandardRasterizer(uv_size)
-            verts, uvcoords, faces, uvfaces = load_obj(obj_filename)
-            verts = verts[None, ...]
-            uvcoords = uvcoords[None, ...]
-            faces = faces[None, ...]
-            uvfaces = uvfaces[None, ...]
-        else:
-            NotImplementedError
+        self.shape_light_intensity = 1.7
+        # dark light
+        self.light_directions = [
+            [-1, 1, 1],
+            [1, 1, 1],
+            [-1, -1, 1],
+            [1, -1, 1],
+            [-1, 1, -1],
+            [1, 1, -1],
+            [-1, -1, -1],
+            [1, -1, -1],
+            [0, 0, 1]
+        ]
+
+        self.light_directions = [
+            [-1, 1, 1],
+            [1, 1, 1],
+            [-1, -1, 1],
+            [1, -1, 1],
+            [0, 0, 1]
+        ]
+        parent_dir = os.path.dirname(obj_filename)
+
+        verts, faces, aux = load_obj(obj_filename)
+        uvcoords = aux.verts_uvs[None, ...]  # (N, V, 2)
+        # uvfaces = faces.textures_idx[None, ...]  # (N, F, 3)
+        # faces = faces.verts_idx[None, ...]
+
+        uvfaces = torch.load(f'{parent_dir}/uvfaces_v2.pth')
+        faces = torch.load(f'{parent_dir}/faces_v2.pth')
+
+        self.rasterizer = Pytorch3dRasterizer(image_size)
+        self.uv_rasterizer = Pytorch3dRasterizer(image_size)
+        self.silhouette_renderer = SilhouetteRasterizer(image_size)
 
         # faces
-        dense_triangles = util.generate_triangles(uv_size, uv_size)
-        self.register_buffer('dense_faces', torch.from_numpy(dense_triangles).long()[None,:,:])
-        self.register_buffer('faces', faces)
-        self.register_buffer('raw_uvcoords', uvcoords)
+        dense_triangles = util.generate_triangles(self.image_size, self.image_size)
+        self.register_buffer('dense_faces', torch.from_numpy(dense_triangles).long()[None, :, :], persistent=False)
+        self.register_buffer('faces', faces, persistent=False)
+        self.register_buffer('raw_uvcoords', uvcoords, persistent=False)
 
         # uv coords
-        uvcoords = torch.cat([uvcoords, uvcoords[:,:,0:1]*0.+1.], -1) #[bz, ntv, 3]
-        uvcoords = uvcoords*2 - 1; uvcoords[...,1] = -uvcoords[...,1]
+        uvcoords = torch.cat([uvcoords, uvcoords[:, :, 0:1] * 0. + 1.], -1)  # [bz, ntv, 3]
+        uvcoords = uvcoords * 2 - 1
+        uvcoords[..., 1] = -uvcoords[..., 1]
         face_uvcoords = util.face_vertices(uvcoords, uvfaces)
-        self.register_buffer('uvcoords', uvcoords)
-        self.register_buffer('uvfaces', uvfaces)
-        self.register_buffer('face_uvcoords', face_uvcoords)
+        self.register_buffer('uvcoords', uvcoords, persistent=False)
+        self.register_buffer('uvfaces', uvfaces, persistent=False)
+        self.register_buffer('face_uvcoords', face_uvcoords, persistent=False)
+
+        # Get UV coords for each vertex in the mesh
+        self.register_buffer('true_uvcoords', torch.load(f'{parent_dir}/vertex_uvcoords.pth'), persistent=False)
 
         # shape colors, for rendering shape overlay
-        colors = torch.tensor([180, 180, 180])[None, None, :].repeat(1, faces.max()+1, 1).float()/255.
+        self.predefined_colors = blue_color = [170, 194, 235]
+        colors = torch.tensor(self.predefined_colors)[None, None, :].repeat(1, faces.max() + 1, 1).float() / 255.
         face_colors = util.face_vertices(colors, faces)
-        self.register_buffer('face_colors', face_colors)
-
+        self.register_buffer('face_colors', face_colors, persistent=False)
         ## SH factors for lighting
         pi = np.pi
-        constant_factor = torch.tensor([1/np.sqrt(4*pi), ((2*pi)/3)*(np.sqrt(3/(4*pi))), ((2*pi)/3)*(np.sqrt(3/(4*pi))),\
-                           ((2*pi)/3)*(np.sqrt(3/(4*pi))), (pi/4)*(3)*(np.sqrt(5/(12*pi))), (pi/4)*(3)*(np.sqrt(5/(12*pi))),\
-                           (pi/4)*(3)*(np.sqrt(5/(12*pi))), (pi/4)*(3/2)*(np.sqrt(5/(12*pi))), (pi/4)*(1/2)*(np.sqrt(5/(4*pi)))]).float()
-        self.register_buffer('constant_factor', constant_factor)
-    
-    def forward(self, vertices, transformed_vertices, albedos, lights=None, light_type='point'):
+        constant_factor = torch.tensor(
+            [1 / np.sqrt(4 * pi), ((2 * pi) / 3) * (np.sqrt(3 / (4 * pi))), ((2 * pi) / 3) * (np.sqrt(3 / (4 * pi))), \
+             ((2 * pi) / 3) * (np.sqrt(3 / (4 * pi))), (pi / 4) * (3) * (np.sqrt(5 / (12 * pi))),
+             (pi / 4) * (3) * (np.sqrt(5 / (12 * pi))), \
+             (pi / 4) * (3) * (np.sqrt(5 / (12 * pi))), (pi / 4) * (3 / 2) * (np.sqrt(5 / (12 * pi))),
+             (pi / 4) * (1 / 2) * (np.sqrt(5 / (4 * pi)))]).float()
+
+        self.register_buffer('constant_factor', constant_factor, persistent=False)
+
+    def forward(self, vertices, transformed_vertices, albedos=None, lights=None, light_type='point', faces=None,
+                face_uvcoords=None, face_masks=None, render_only_soft_silhouette=False):
         '''
         -- Texture Rendering
         vertices: [batch_size, V, 3], vertices in world space, for calculating normals, then shading
         transformed_vertices: [batch_size, V, 3], range:normalized to [-1,1], projected vertices in image space (that is aligned to the iamge pixel), for rasterization
         albedos: [batch_size, 3, h, w], uv map
-        lights: 
+        lights:
             spherical homarnic: [N, 9(shcoeff), 3(rgb)]
             points/directional lighting: [N, n_lights, 6(xyzrgb)]
         light_type:
             point or directional
         '''
+        input_type = vertices.type()
+
+        vertices = vertices.float()
+        transformed_vertices = transformed_vertices.float()
+
+        if faces is None:
+            faces = self.faces
+            face_uvcoords = self.face_uvcoords
+
         batch_size = vertices.shape[0]
+
         ## rasterizer near 0 far 100. move mesh so minz larger than 0
-        transformed_vertices[:,:,2] = transformed_vertices[:,:,2] + 10
-        # attributes
-        face_vertices = util.face_vertices(vertices, self.faces.expand(batch_size, -1, -1))
-        normals = util.vertex_normals(vertices, self.faces.expand(batch_size, -1, -1)); face_normals = util.face_vertices(normals, self.faces.expand(batch_size, -1, -1))
-        transformed_normals = util.vertex_normals(transformed_vertices, self.faces.expand(batch_size, -1, -1)); transformed_face_normals = util.face_vertices(transformed_normals, self.faces.expand(batch_size, -1, -1))
-        
-        attributes = torch.cat([self.face_uvcoords.expand(batch_size, -1, -1, -1), 
-                                transformed_face_normals.detach(), 
-                                face_vertices.detach(), 
-                                face_normals], 
-                                -1)
-        # rasterize
-        rendering = self.rasterizer(transformed_vertices, self.faces.expand(batch_size, -1, -1), attributes)
-        
-        ####
-        # vis mask
-        alpha_images = rendering[:, -1, :, :][:, None, :, :].detach()
+        transformed_vertices[:, :, 2] = transformed_vertices[:, :, 2] + 10
 
-        # albedo
-        uvcoords_images = rendering[:, :3, :, :]; grid = (uvcoords_images).permute(0, 2, 3, 1)[:, :, :, :2]
-        albedo_images = F.grid_sample(albedos, grid, align_corners=False)
+        (
+            soft_alpha_images,
+            vertices_visibility
+        ) = self.silhouette_renderer(
+            transformed_vertices,
+            faces.expand(batch_size, -1, -1)
+        )
 
-        # visible mask for pixels with positive normal direction
-        transformed_normal_map = rendering[:, 3:6, :, :].detach()
-        pos_mask = (transformed_normal_map[:, 2:, :, :] < -0.05).float()
+        if not render_only_soft_silhouette:
+            # attributes
+            face_vertices = util.face_vertices(vertices, faces.expand(batch_size, -1, -1))
+            attributes = face_uvcoords.expand(batch_size, -1, -1, -1)
 
-        # shading
-        normal_images = rendering[:, 9:12, :, :]
-        if lights is not None:
-            if lights.shape[1] == 9:
-                shading_images = self.add_SHlight(normal_images, lights)
+            transformed_normals = util.vertex_normals(transformed_vertices, faces.expand(batch_size, -1, -1))
+            transformed_face_normals = util.face_vertices(transformed_normals, faces.expand(batch_size, -1, -1))
+
+            attributes = torch.cat(
+                [
+                    attributes,
+                    transformed_face_normals.detach(),
+                    face_vertices.detach()
+                ],
+                -1
+            )
+
+            normals = util.vertex_normals(vertices, faces.expand(batch_size, -1, -1))
+            face_normals = util.face_vertices(normals, faces.expand(batch_size, -1, -1))
+            attributes = torch.cat([attributes, face_normals], -1)
+
+            if face_masks is not None:
+                face_masks = face_masks.expand(batch_size, -1, -1, -1).clone()
+                attributes = torch.cat([face_masks, attributes], -1)
+
+            # rasterize
+            rendering_ = self.rasterizer(transformed_vertices, faces.expand(batch_size, -1, -1), attributes)
+
+            if face_masks is not None:
+                area_alpha_images = (rendering_[:, :face_masks.shape[-1]].detach().clone() > 0.0).float()
+                rendering = rendering_[:, face_masks.shape[-1]:]
             else:
-                if light_type=='point':
-                    vertice_images = rendering[:, 6:9, :, :].detach()
-                    shading = self.add_pointlight(vertice_images.permute(0,2,3,1).reshape([batch_size, -1, 3]), normal_images.permute(0,2,3,1).reshape([batch_size, -1, 3]), lights)
-                    shading_images = shading.reshape([batch_size, albedo_images.shape[2], albedo_images.shape[3], 3]).permute(0,3,1,2)
-                else:
-                    shading = self.add_directionlight(normal_images.permute(0,2,3,1).reshape([batch_size, -1, 3]), lights)
-                    shading_images = shading.reshape([batch_size, albedo_images.shape[2], albedo_images.shape[3], 3]).permute(0,3,1,2)
-            images = albedo_images*shading_images
-        else:
-            images = albedo_images
-            shading_images = images.detach()*0.
+                rendering = rendering_
 
-        outputs = {
-            'images': images*alpha_images,
-            'albedo_images': albedo_images*alpha_images,
-            'alpha_images': alpha_images,
-            'pos_mask': pos_mask,
-            'shading_images': shading_images,
-            'grid': grid,
-            'normals': normals,
-            'normal_images': normal_images*alpha_images,
-            'transformed_normals': transformed_normals,
-        }
-        
-        return outputs
+            # vis mask
+            alpha_images = rendering[:, -1, :, :][:, None, :, :].detach()
+
+            # albedo
+            uvcoords_images = rendering[:, :3, :, :]
+            normal_images = rendering[:, -4:-1, :, :]
+            vertice_images = rendering[:, 6:9, :, :].detach()
+
+            if albedos is not None:
+                grid = (uvcoords_images).permute(0, 2, 3, 1)[:, :, :, :2]
+                albedo_images = F.grid_sample(albedos, grid, align_corners=False)
+
+            if lights is not None:
+                # visible mask for pixels with positive normal direction
+                transformed_normal_map = rendering[:, 3:6, :, :].detach()
+                pos_mask = (transformed_normal_map[:, 2:, :, :] < -0.05).float()
+
+            if lights is not None:
+                # shading
+                if lights.shape[1] == 9:
+                    shading_images = self.add_SHlight(normal_images, lights)
+                else:
+                    if light_type == 'point':
+                        shading = self.add_pointlight(vertice_images.permute(0, 2, 3, 1).reshape([batch_size, -1, 3]),
+                                                      normal_images.permute(0, 2, 3, 1).reshape([batch_size, -1, 3]),
+                                                      lights)
+                        shading_images = shading.reshape(
+                            [batch_size, albedo_images.shape[2], albedo_images.shape[3], 3]).permute(0, 3, 1, 2)
+                    else:
+                        shading = self.add_directionlight(
+                            normal_images.permute(0, 2, 3, 1).reshape([batch_size, -1, 3]),
+                            lights)
+                        shading_images = shading.reshape(
+                            [batch_size, albedo_images.shape[2], albedo_images.shape[3], 3]).permute(0, 3, 1, 2)
+
+            elif albedos is not None:
+                images = albedo_images
+                shading_images = images.detach() * 0.0
+
+            alpha_images = alpha_images.type(input_type)
+
+            outputs = {
+                'alpha_images': alpha_images,
+                'area_alpha_images': area_alpha_images.type(input_type) if face_masks is not None else None,
+                'soft_alpha_images': soft_alpha_images.type(input_type),
+                'uvcoords_images': uvcoords_images.type(input_type) * alpha_images,
+                'normal_images': normal_images.type(input_type) * alpha_images,
+                'vertice_images': vertice_images.type(input_type) * alpha_images,
+                'vertices_visibility': vertices_visibility.type(input_type),
+            }
+
+            if albedos is not None:
+                outputs['images'] = shading_images * albedo_images
+                outputs['albedo_images'] = albedo_images.type(input_type) * alpha_images
+
+            if lights is not None:
+                outputs['pos_mask'] = pos_mask.type(input_type)
+                outputs['shading_images'] = shading_images.type(input_type)
+
+            return outputs
+
+        else:
+            outputs = {
+                'area_alpha_images': area_alpha_images.type(input_type) if face_masks is not None else None,
+                'soft_alpha_images': soft_alpha_images.type(input_type),
+                'vertices_visibility': vertices_visibility.type(input_type)
+            }
+
+            return outputs
 
     def add_SHlight(self, normal_images, sh_coeff):
         '''
@@ -296,13 +374,13 @@ class SRenderY(nn.Module):
         '''
         N = normal_images
         sh = torch.stack([
-                N[:,0]*0.+1., N[:,0], N[:,1], \
-                N[:,2], N[:,0]*N[:,1], N[:,0]*N[:,2], 
-                N[:,1]*N[:,2], N[:,0]**2 - N[:,1]**2, 3*(N[:,2]**2) - 1
-                ], 
-                1) # [bz, 9, h, w]
-        sh = sh*self.constant_factor[None,:,None,None]
-        shading = torch.sum(sh_coeff[:,:,:,None,None]*sh[:,:,None,:,:], 1) # [bz, 9, 3, h, w]  
+            N[:, 0] * 0. + 1., N[:, 0], N[:, 1], \
+            N[:, 2], N[:, 0] * N[:, 1], N[:, 0] * N[:, 2],
+            N[:, 1] * N[:, 2], N[:, 0] ** 2 - N[:, 1] ** 2, 3 * (N[:, 2] ** 2) - 1
+        ],
+            1)  # [bz, 9, h, w]
+        sh = sh * self.constant_factor[None, :, None, None]
+        shading = torch.sum(sh_coeff[:, :, :, None, None] * sh[:, :, None, :, :], 1)  # [bz, 9, 3, h, w]
         return shading
 
     def add_pointlight(self, vertices, normals, lights):
@@ -312,11 +390,12 @@ class SRenderY(nn.Module):
         returns:
             shading: [bz, nv, 3]
         '''
-        light_positions = lights[:,:,:3]; light_intensities = lights[:,:,3:]
-        directions_to_lights = F.normalize(light_positions[:,:,None,:] - vertices[:,None,:,:], dim=3)
+        light_positions = lights[:, :, :3];
+        light_intensities = lights[:, :, 3:]
+        directions_to_lights = F.normalize(light_positions[:, :, None, :] - vertices[:, None, :, :], dim=3)
         # normals_dot_lights = torch.clamp((normals[:,None,:,:]*directions_to_lights).sum(dim=3), 0., 1.)
-        normals_dot_lights = (normals[:,None,:,:]*directions_to_lights).sum(dim=3)
-        shading = normals_dot_lights[:,:,:,None]*light_intensities[:,:,None,:]
+        normals_dot_lights = (normals[:, None, :, :] * directions_to_lights).sum(dim=3)
+        shading = normals_dot_lights[:, :, :, None] * light_intensities[:, :, None, :]
         return shading.mean(1)
 
     def add_directionlight(self, normals, lights):
@@ -326,50 +405,59 @@ class SRenderY(nn.Module):
         returns:
             shading: [bz, nv, 3]
         '''
-        light_direction = lights[:,:,:3]; light_intensities = lights[:,:,3:]
-        directions_to_lights = F.normalize(light_direction[:,:,None,:].expand(-1,-1,normals.shape[1],-1), dim=3)
+        light_direction = lights[:, :, :3];
+        light_intensities = lights[:, :, 3:]
+        directions_to_lights = F.normalize(light_direction[:, :, None, :].expand(-1, -1, normals.shape[1], -1), dim=3)
         # normals_dot_lights = torch.clamp((normals[:,None,:,:]*directions_to_lights).sum(dim=3), 0., 1.)
         # normals_dot_lights = (normals[:,None,:,:]*directions_to_lights).sum(dim=3)
-        normals_dot_lights = torch.clamp((normals[:,None,:,:]*directions_to_lights).sum(dim=3), 0., 1.)
-        shading = normals_dot_lights[:,:,:,None]*light_intensities[:,:,None,:]
+        normals_dot_lights = torch.clamp((normals[:, None, :, :] * directions_to_lights).sum(dim=3), 0., 1.)
+        shading = normals_dot_lights[:, :, :, None] * light_intensities[:, :, None, :]
         return shading.mean(1)
 
-    def render_shape(self, vertices, transformed_vertices, colors = None, images=None, detail_normal_images=None, 
-                lights=None, return_grid=False, uv_detail_normals=None, h=None, w=None):
+    def render_shape(self, vertices, transformed_vertices,
+                     images=None, detail_normal_images=None, lights=None, faces=None, face_uvcoords=None):
         '''
         -- rendering shape with detail normal map
         '''
         batch_size = vertices.shape[0]
+
+        input_type = vertices.type()
+
+        vertices = vertices.float()
+        transformed_vertices = transformed_vertices.float()
+
+        if faces is None:
+            faces = self.faces
+            face_uvcoords = self.face_uvcoords
+            face_colors = self.face_colors
+
+        else:
+            colors = torch.tensor(self.predefined_colors)[None, None, :].repeat(1, faces.max() + 1, 1).float().to(
+                faces.device) / 255.
+            face_colors = util.face_vertices(colors, faces)
+
         # set lighting
         if lights is None:
             light_positions = torch.tensor(
-                [
-                [-1,1,1],
-                [1,1,1],
-                [-1,-1,1],
-                [1,-1,1],
-                [0,0,1]
-                ]
-            )[None,:,:].expand(batch_size, -1, -1).float()
-            light_intensities = torch.ones_like(light_positions).float()*1.7
+                self.light_directions
+            )[None, :, :].expand(batch_size, -1, -1).float()
+            light_intensities = torch.ones_like(light_positions).float() * self.shape_light_intensity
             lights = torch.cat((light_positions, light_intensities), 2).to(vertices.device)
-        transformed_vertices[:,:,2] = transformed_vertices[:,:,2] + 10
+        transformed_vertices[:, :, 2] = transformed_vertices[:, :, 2] + 10
 
         # Attributes
-        face_vertices = util.face_vertices(vertices, self.faces.expand(batch_size, -1, -1))
-        normals = util.vertex_normals(vertices, self.faces.expand(batch_size, -1, -1)); face_normals = util.face_vertices(normals, self.faces.expand(batch_size, -1, -1))
-        transformed_normals = util.vertex_normals(transformed_vertices, self.faces.expand(batch_size, -1, -1)); transformed_face_normals = util.face_vertices(transformed_normals, self.faces.expand(batch_size, -1, -1))
-        if colors is None:
-            colors = self.face_colors.expand(batch_size, -1, -1, -1)
-        attributes = torch.cat([colors, 
-                        transformed_face_normals.detach(), 
-                        face_vertices.detach(), 
-                        face_normals,
-                        self.face_uvcoords.expand(batch_size, -1, -1, -1)], 
-                        -1)
+        face_vertices = util.face_vertices(vertices, faces.expand(batch_size, -1, -1))
+        normals = util.vertex_normals(vertices, faces.expand(batch_size, -1, -1))
+        face_normals = util.face_vertices(normals, faces.expand(batch_size, -1, -1))
+        transformed_normals = util.vertex_normals(transformed_vertices, faces.expand(batch_size, -1, -1))
+        transformed_face_normals = util.face_vertices(transformed_normals, faces.expand(batch_size, -1, -1))
+        attributes = torch.cat([face_colors.expand(batch_size, -1, -1, -1),
+                                transformed_face_normals.detach(),
+                                face_vertices.detach(),
+                                face_normals],
+                               -1)
         # rasterize
-        # import ipdb; ipdb.set_trace()
-        rendering = self.rasterizer(transformed_vertices, self.faces.expand(batch_size, -1, -1), attributes, h, w)
+        rendering = self.rasterizer(transformed_vertices, faces.expand(batch_size, -1, -1), attributes)
 
         ####
         alpha_images = rendering[:, -1, :, :][:, None, :, :].detach()
@@ -386,43 +474,42 @@ class SRenderY(nn.Module):
         if detail_normal_images is not None:
             normal_images = detail_normal_images
 
-        shading = self.add_directionlight(normal_images.permute(0,2,3,1).reshape([batch_size, -1, 3]), lights)
-        shading_images = shading.reshape([batch_size, albedo_images.shape[2], albedo_images.shape[3], 3]).permute(0,3,1,2).contiguous()        
-        shaded_images = albedo_images*shading_images
+        shading = self.add_directionlight(normal_images.permute(0, 2, 3, 1).reshape([batch_size, -1, 3]), lights)
+        shading_images = shading.reshape([batch_size, albedo_images.shape[2], albedo_images.shape[3], 3]).permute(0, 3,
+                                                                                                                  1,
+                                                                                                                  2).contiguous()
+        shaded_images = albedo_images * shading_images
 
-        alpha_images = alpha_images*pos_mask
+        alpha_images = alpha_images * pos_mask
         if images is None:
-            shape_images = shaded_images*alpha_images + torch.zeros_like(shaded_images).to(vertices.device)*(1-alpha_images)
+            shape_images = shaded_images * alpha_images + torch.ones_like(shaded_images).to(vertices.device) * (
+                    1 - alpha_images)
         else:
-            shape_images = shaded_images*alpha_images + images*(1-alpha_images)
-        if return_grid:
-            uvcoords_images = rendering[:, 12:15, :, :]; 
-            grid = (uvcoords_images).permute(0, 2, 3, 1)[:, :, :, :2]
-            return shape_images, normal_images, grid, alpha_images
-        else:
-            return shape_images
-    
+            shape_images = shaded_images * alpha_images + images * (1 - alpha_images)
+
+        return shape_images.type(input_type)
+
     def render_depth(self, transformed_vertices):
         '''
         -- rendering depth
         '''
         batch_size = transformed_vertices.shape[0]
 
-        transformed_vertices[:,:,2] = transformed_vertices[:,:,2] - transformed_vertices[:,:,2].min()
-        z = -transformed_vertices[:,:,2:].repeat(1,1,3).clone()
-        z = z-z.min()
-        z = z/z.max()
+        transformed_vertices[:, :, 2] = transformed_vertices[:, :, 2] - transformed_vertices[:, :, 2].min()
+        z = -transformed_vertices[:, :, 2:].repeat(1, 1, 3).clone()
+        z = z - z.min()
+        z = z / z.max()
         # Attributes
         attributes = util.face_vertices(z, self.faces.expand(batch_size, -1, -1))
         # rasterize
-        transformed_vertices[:,:,2] = transformed_vertices[:,:,2] + 10
+        transformed_vertices[:, :, 2] = transformed_vertices[:, :, 2] + 10
         rendering = self.rasterizer(transformed_vertices, self.faces.expand(batch_size, -1, -1), attributes)
 
         ####
         alpha_images = rendering[:, -1, :, :][:, None, :, :].detach()
         depth_images = rendering[:, :1, :, :]
         return depth_images
-    
+
     def render_colors(self, transformed_vertices, colors):
         '''
         -- rendering colors: could be rgb color/ normals, etc
@@ -436,16 +523,24 @@ class SRenderY(nn.Module):
         rendering = self.rasterizer(transformed_vertices, self.faces.expand(batch_size, -1, -1), attributes)
         ####
         alpha_images = rendering[:, [-1], :, :].detach()
-        images = rendering[:, :3, :, :]* alpha_images
+        images = rendering[:, :3, :, :] * alpha_images
         return images
 
-    def world2uv(self, vertices):
+    def world2uv(self, vertices, faces=None, uvcoords=None, uvfaces=None):
         '''
         warp vertices from world space to uv space
         vertices: [bz, V, 3]
         uv_vertices: [bz, 3, h, w]
         '''
+        if uvcoords is None:
+            faces = self.faces
+            uvcoords = self.uvcoords
+            uvfaces = self.uvfaces
+
         batch_size = vertices.shape[0]
-        face_vertices = util.face_vertices(vertices, self.faces.expand(batch_size, -1, -1))
-        uv_vertices = self.uv_rasterizer(self.uvcoords.expand(batch_size, -1, -1), self.uvfaces.expand(batch_size, -1, -1), face_vertices)[:, :3]
+        face_vertices = util.face_vertices(vertices, faces.expand(batch_size, -1, -1))
+
+        uv_vertices = self.uv_rasterizer(uvcoords.expand(batch_size, -1, -1),
+                                         uvfaces.expand(batch_size, -1, -1),
+                                         face_vertices)[:, :3]
         return uv_vertices
