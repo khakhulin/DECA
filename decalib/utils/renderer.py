@@ -157,7 +157,7 @@ class SilhouetteRasterizer(nn.Module):
 
 
 class SRenderY(nn.Module):
-    def __init__(self, image_size, obj_filename, uv_size=256, rasterizer_type='pytorch3d'):
+    def __init__(self, image_size, obj_filename, files_dir=None, uv_size=256, rasterizer_type='pytorch3d'):
         super(SRenderY, self).__init__()
         self.image_size = image_size
         self.shape_light_intensity = 1.7
@@ -181,7 +181,8 @@ class SRenderY(nn.Module):
             [1, -1, 1],
             [0, 0, 1]
         ]
-        parent_dir = os.path.dirname(obj_filename)
+
+        parent_dir = os.path.dirname(obj_filename) if files_dir is None else files_dir
 
         verts, faces, aux = load_obj(obj_filename)
         uvcoords = aux.verts_uvs[None, ...]  # (N, V, 2)
